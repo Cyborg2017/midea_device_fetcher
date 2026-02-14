@@ -268,7 +268,23 @@ class MideaAllInOneGetter:
         return len(results) > 0
     
     def _get_device_list(self):
-        """从API获取设备列表"""
+        """从API获取设备列表 - 获取所有家庭的设备"""
+        # 先获取所有 home_id
+        home_ids = self._get_all_home_ids()
+        if not home_ids:
+            print("❌ 无法获取家庭ID列表")
+            return []
+        
+        all_devices = []
+        
+        for home_id in home_ids:
+            devices = self._get_devices_for_home(home_id)
+            all_devices.extend(devices)
+        
+        return all_devices
+    
+    def _get_all_home_ids(self):
+        """获取所有家庭ID列表"""
         headers = {
             "content-type": "application/json; charset=utf-8",
             "secretVersion": "1",
@@ -276,6 +292,42 @@ class MideaAllInOneGetter:
         }
         
         data = {
+            "reqId": token_hex(16),
+            "stamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        }
+        json_data = json.dumps(data, separators=(',', ':'))
+        random = str(int(time.time()))
+        signature = self._sign_request(json_data, random)
+        
+        headers_copy = headers.copy()
+        headers_copy["random"] = random
+        headers_copy["sign"] = signature
+        
+        try:
+            response = self.session.post(
+                f"{self.api_base}?alias=/v1/homegroup/list/get",
+                headers=headers_copy,
+                data=json_data,
+                timeout=15
+            )
+            result = response.json()
+            if result.get("code") == 0 and "data" in result:
+                home_list = result["data"].get("homeList", [])
+                return [h.get("homegroupId") for h in home_list if h.get("homegroupId")]
+        except Exception as e:
+            print(f"❌ 获取家庭ID列表异常: {e}")
+        return []
+    
+    def _get_devices_for_home(self, home_id):
+        """获取指定家庭的设备列表"""
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "secretVersion": "1",
+            "accesstoken": self.access_token,
+        }
+        
+        data = {
+            "homegroupId": home_id,
             "reqId": token_hex(16),
             "stamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         }
@@ -318,6 +370,7 @@ class MideaAllInOneGetter:
                             "modelNumber": appliance.get("modelNumber", "0"),
                             "productModel": appliance.get("productModel", ""),
                             "enterpriseCode": appliance.get("enterpriseCode", "0000"),
+                            "smartProductId": appliance.get("smartProductId", ""),
                             "online": appliance.get("onlineStatus") == "1",
                         }
                         devices.append(device)
@@ -329,9 +382,12 @@ class MideaAllInOneGetter:
             return []
     
     def get_device_lua_and_status(self, device, headers):
-        """一体化获取设备的Lua文件和Status属性"""
+        """一体化获取设备的Lua文件、Plugin压缩包和Status属性"""
         print(f"  📥 下载Lua文件...")
         lua_file_name = self.download_device_lua(device, headers)
+        
+        print(f"  📦 下载Plugin压缩包...")
+        plugin_file_name = self.download_device_plugin(device, headers)
         
         print(f"  📊 获取Status属性...")
         status_data = self.get_device_status(device, headers)
@@ -340,20 +396,23 @@ class MideaAllInOneGetter:
             return {
                 "device": device,
                 "lua_file": lua_file_name,
+                "plugin_file": plugin_file_name,
                 "status_attributes": len(status_data),
                 "success": True
             }
-        elif status_data:  # 至少Status获取成功
+        elif status_data:
             return {
                 "device": device,
-                "lua_file": "下载失败",
+                "lua_file": lua_file_name or "下载失败",
+                "plugin_file": plugin_file_name,
                 "status_attributes": len(status_data),
                 "success": True
             }
-        elif lua_file_name:  # 至少Lua获取成功
+        elif lua_file_name:
             return {
                 "device": device,
                 "lua_file": lua_file_name,
+                "plugin_file": plugin_file_name,
                 "status_attributes": 0,
                 "success": True
             }
@@ -374,6 +433,126 @@ class MideaAllInOneGetter:
             return decrypted.decode("utf-8", errors="ignore")
         except Exception:
             return lua_code  # 如果解密失败，返回原始内容
+    
+    def download_device_plugin(self, device, headers):
+        """下载设备Plugin压缩包 - 按照官方cloud.py实现"""
+        sn = device.get("sn", "")
+        sn8 = device.get("sn8", "") or device.get("modelNumber", "")
+        appliance_code = device.get("applianceCode", "")  # 使用原始applianceCode，不是sn
+        smart_product_id = device.get("smartProductId", "")
+        model_number = device.get("modelNumber", "0")
+        manufacturer_code = device.get("enterpriseCode", "0000")
+        
+        if not sn8 or not appliance_code or not smart_product_id:
+            print(f"    ⚠️ 缺少必要信息(sn8/applianceCode/smartProductId)，跳过Plugin下载")
+            return None
+        
+        # device_type 必须是整数
+        device_type_val = device.get("type", 0)
+        if isinstance(device_type_val, str):
+            if device_type_val.startswith("0x"):
+                device_type_val = int(device_type_val, 16)
+            else:
+                try:
+                    device_type_val = int(device_type_val)
+                except:
+                    device_type_val = 0
+        
+        # 构建applianceList - 按照官方cloud.py实现
+        appliance_info = {
+            "appModel": sn8,
+            "appEnterprise": manufacturer_code,
+            "appType": f"0x{device_type_val:02X}",
+            "applianceCode": str(appliance_code),  # 使用原始applianceCode
+            "smartProductId": str(smart_product_id),
+            "modelNumber": model_number or "0",
+            "versionCode": 0
+        }
+        
+        plugin_data = {
+            "applianceList": json.dumps([appliance_info]),
+            "iotAppId": "900",
+            "match": "1",
+            "clientType": "1",
+            "clientVersion": 201,
+            "reqId": token_hex(16),
+            "stamp": datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        }
+        
+        json_data = json.dumps(plugin_data, separators=(',', ':'))
+        random = str(int(time.time()))
+        signature = self._sign_request(json_data, random)
+        
+        headers_copy = headers.copy()
+        headers_copy["random"] = random
+        headers_copy["sign"] = signature
+        
+        try:
+            response = self.session.post(
+                f"{self.api_base}?alias=/v1/plugin/update/getPluginV3",
+                headers=headers_copy,
+                data=json_data,
+                timeout=15
+            )
+            
+            result = response.json()
+            if str(result.get("code")) == "0" and result.get("data", {}).get("list"):
+                plugin_list = result["data"]["list"]
+                if not plugin_list:
+                    print(f"    ⚠️ 无可用Plugin")
+                    return None
+                
+                # 找到匹配的plugin（优先匹配applianceCode+appType）
+                matched_plugin = None
+                app_type_str = f"0x{device_type_val:02X}"
+                for plugin in plugin_list:
+                    if plugin.get("applianceCode") == str(appliance_code) and plugin.get("appType") == app_type_str:
+                        matched_plugin = plugin
+                        break
+                
+                # 如果没有精确匹配，使用第一个匹配appType的
+                if not matched_plugin:
+                    for plugin in plugin_list:
+                        if plugin.get("appType") == app_type_str:
+                            matched_plugin = plugin
+                            break
+                
+                if not matched_plugin:
+                    matched_plugin = plugin_list[0]  # 使用第一个
+                
+                zip_url = matched_plugin.get("url")
+                zip_title = matched_plugin.get("title", f"plugin_0x{device_type_val:02X}.zip")
+                
+                if not zip_url:
+                    print(f"    ⚠️ Plugin无下载URL")
+                    return None
+                
+                # 创建文件夹
+                product_model = device.get("productModel", "") or device.get("modelNumber", "")
+                product_model = product_model.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_").replace("?", "_").replace("\"", "_").replace("<", "_").replace(">", "_").replace("|", "_")
+                device_type_str = f"0x{device_type_val:02X}"
+                device_folder_name = f"T{device_type_str}_{sn8}_{product_model}_{device['name'].replace(' ', '_')}"
+                plugin_folder = self.output_dir / device_folder_name
+                plugin_folder.mkdir(parents=True, exist_ok=True)
+                
+                # 下载zip文件
+                zip_response = self.session.get(zip_url, timeout=15)
+                if zip_response.status_code == 200:
+                    zip_file_path = plugin_folder / zip_title
+                    with open(zip_file_path, 'wb') as f:
+                        f.write(zip_response.content)
+                    print(f"    ✅ Plugin保存: {zip_title}")
+                    return zip_title
+                else:
+                    print(f"    🔴 Plugin下载失败: {zip_response.status_code}")
+                    return None
+            else:
+                print(f"    🔴 Plugin获取失败: {result.get('msg', '未知错误')}")
+                return None
+                
+        except Exception as e:
+            print(f"    💥 Plugin下载异常: {e}")
+            return None
     
     def download_device_lua(self, device, headers):
         """下载设备Lua文件"""
@@ -574,6 +753,7 @@ class MideaAllInOneGetter:
                     "device_type": result["device"]["type"],
                     "online": result["device"].get("online", False),
                     "lua_file": result["lua_file"],
+                    "plugin_file": result.get("plugin_file"),
                     "status_attributes": result["status_attributes"],
                     "folder": f"{result['device']['type']}_{result['device']['name'].replace(' ', '_')}"
                 }
@@ -609,6 +789,8 @@ class MideaAllInOneGetter:
         for result in report_data['results']:
             content += f"\n设备: {result['device_name']} ({result['device_type']})\n"
             content += f"  Lua文件: {result['lua_file']}\n"
+            plugin_file = result.get('plugin_file', '无')
+            content += f"  Plugin压缩包: {plugin_file}\n"
             content += f"  Status属性: {result['status_attributes']}个\n"
             content += f"  数据文件夹: {result['folder']}\n"
         
@@ -620,7 +802,7 @@ class MideaAllInOneGetter:
         """运行一体化获取流程"""
         print("="*60)
         print("美的云设备一体化获取工具")
-        print("同时获取Lua文件和Status属性文件")
+        print("同时获取Lua文件、Plugin压缩包和Status属性文件")
         print("="*60)
         
         # 1. 登录
